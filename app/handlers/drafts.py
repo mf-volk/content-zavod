@@ -1,0 +1,743 @@
+"""Draft management handlers."""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+from aiogram import Bot, Router, F
+from aiogram.types import Message, CallbackQuery, InputMediaPhoto
+from aiogram.fsm.context import FSMContext
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+
+from app.db.models import User, ManagedChannel, Draft, DraftStatus, DraftMedia
+from app.services.publisher import publish_content
+from app.llm_client import llm_client
+from app.utils import sanitize_html
+from app.handlers.keyboards import (
+    drafts_list_keyboard,
+    draft_edit_keyboard,
+    back_to_menu_keyboard,
+    back_to_draft_keyboard,
+)
+
+from app.handlers.states import DraftStates
+
+logger = logging.getLogger(__name__)
+router = Router(name="drafts")
+
+
+async def get_current_channel(session: AsyncSession, tg_user_id: int) -> Optional[ManagedChannel]:
+    """Get user's current selected channel."""
+    result = await session.execute(
+        select(User)
+        .where(User.tg_user_id == tg_user_id)
+        .options(selectinload(User.current_channel))
+    )
+    user = result.scalar_one_or_none()
+    return user.current_channel if user else None
+
+
+from app.utils import answer_nav
+
+@router.callback_query(F.data == "drafts:list")
+async def list_drafts(
+    callback: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    """Show drafts list for current channel."""
+    channel = await get_current_channel(session, callback.from_user.id)
+
+    if not channel:
+        await callback.message.edit_text(
+            "⚠️ Сначала выбери канал для работы.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    # Get drafts (exclude published)
+    result = await session.execute(
+        select(Draft)
+        .where(
+            Draft.managed_channel_id == channel.id,
+            Draft.status != DraftStatus.PUBLISHED,
+        )
+        .order_by(Draft.created_at.desc())
+        .limit(20)
+    )
+    drafts = result.scalars().all()
+
+    if not drafts:
+        text = (
+            f"✏️ <b>Черновики для канала {channel.title}</b>\n\n"
+            "Пока нет черновиков.\n\n"
+            "Создай черновик из идеи или вручную."
+        )
+    else:
+        text = (
+            f"✏️ <b>Черновики для канала {channel.title}</b>\n\n"
+            f"Всего: {len(drafts)}\n\n"
+            "Выбери черновик для редактирования:"
+        )
+
+    draft_list = [(d.id, d.title or d.content[:30], d.status.value) for d in drafts]
+
+    draft_list = [(d.id, d.title or d.content[:30], d.status.value) for d in drafts]
+
+    await answer_nav(
+        callback=callback,
+        label="✏️ Черновики",
+        new_text=text,
+        reply_markup=drafts_list_keyboard(draft_list),
+    )
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data == "drafts:new")
+async def new_draft_start(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Start creating new draft manually."""
+    channel = await get_current_channel(session, callback.from_user.id)
+
+    if not channel:
+        await callback.answer("⚠️ Канал не выбран", show_alert=True)
+        return
+
+    await state.set_state(DraftStates.waiting_for_text)
+
+    await answer_nav(
+        callback=callback,
+        label="➕ Новый черновик",
+        new_text=(
+            "✏️ <b>Новый черновик</b>\n\n"
+            "Отправь текст поста.\n\n"
+            "<i>Можешь использовать HTML разметку:</i>\n"
+            "• <code>&lt;b&gt;жирный&lt;/b&gt;</code>\n"
+            "• <code>&lt;i&gt;курсив&lt;/i&gt;</code>\n"
+            "• <code>&lt;a href=\"url\"&gt;ссылка&lt;/a&gt;</code>"
+        ),
+        reply_markup=back_to_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(DraftStates.waiting_for_text)
+async def process_new_draft_text(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Process new draft text."""
+    channel = await get_current_channel(session, message.from_user.id)
+
+    if not channel:
+        await message.answer("❌ Канал не выбран")
+        await state.clear()
+        return
+
+    # Check if we are editing an existing draft
+    data = await state.get_data()
+    draft_id = data.get("draft_id")
+    mode = data.get("mode")
+
+    if draft_id and mode == "replace":
+        # Update existing draft
+        result = await session.execute(
+            select(Draft)
+            .where(Draft.id == draft_id)
+            .options(selectinload(Draft.media))
+        )
+        draft = result.scalar_one_or_none()
+
+        if draft:
+            draft.content = sanitize_html(message.text or message.html_text)
+            # Update title if needed or keep old? Usually title is derived from content creation or idea.
+            # Let's update title if it was autogenerated, but for now just content.
+            # actually let's update title if it's too different?
+            # Simpler: just update content.
+            
+            # --- PRE-VALIDATION ---
+            try:
+                # We don't strictly need flush for update as ID exists, but we need to verify content
+                await message.answer(
+                    f"✅ <b>Текст обновлён!</b>\n\n"
+                    f"{draft.content}",
+                    reply_markup=draft_edit_keyboard(
+                        draft.id, 
+                        has_media=bool(draft.media),
+                        media_position=draft.media_position,
+                        content_length=len(draft.content) if draft.content else 0
+                    ),
+                    parse_mode="HTML",
+                )
+                
+                # Validation passed
+                await session.commit()
+                await state.clear()
+                
+            except Exception as e:
+                # Check for HTML error
+                if "can't parse entities" in str(e) or "tag" in str(e):
+                    await session.rollback()
+                    await message.answer(
+                        "⚠️ <b>Ошибка форматирования!</b>\n\n"
+                        "Telegram не смог обработать ваш текст. Скорее всего, нарушена структура HTML-тегов.\n\n"
+                        "<b>Частые ошибки:</b>\n"
+                        "• Не закрыт тег: <code>&lt;b&gt;Текст</code> вместо <code>&lt;b&gt;Текст&lt;/b&gt;</code>\n"
+                        "• Пересечение тегов: <code>&lt;b&gt;&lt;i&gt;Текст&lt;/b&gt;&lt;/i&gt;</code> (надо вложенно)\n"
+                        "• Лишние угловые скобки <code>&lt;</code> или <code>&gt;</code>\n\n"
+                        "Пожалуйста, исправьте текст и отправьте снова. Бот <b>не сохранил</b> изменения.",
+                        parse_mode="HTML"
+                    )
+                    return
+                else:
+                    logger.error(f"Draft update validation failed: {e}")
+                    await session.rollback()
+                    await message.answer("❌ Ошибка при сохранении. Попробуйте еще раз.")
+                    return
+            return
+        else:
+            # excessive fallback
+            pass
+
+    # Create new draft
+    title = message.text[:100] if len(message.text) > 100 else message.text
+    if len(title) < len(message.text):
+        # Find last space
+        last_space = title.rfind(" ")
+        if last_space > 50:
+            title = title[:last_space] + "..."
+        else:
+            title = title + "..."
+
+    # Create new draft object (not committed yet)
+    draft = Draft(
+        managed_channel_id=channel.id,
+        title=title,
+        content=sanitize_html(message.text or message.html_text),
+        status=DraftStatus.DRAFT,
+    )
+    session.add(draft)
+    
+    # --- PRE-VALIDATION ---
+    # We must commit to get an ID for the keyboard, BUT if the content is invalid HTML,
+    # we want to abort.
+    # Strategy: Flush to get ID, try to send message. If fail -> rollback.
+    
+    try:
+        await session.flush() # Get ID
+        
+        # Try to send confirmation message (this validates HTML)
+        await message.answer(
+            f"✅ <b>Черновик создан!</b>\n\n"
+            f"{draft.content}",
+            reply_markup=draft_edit_keyboard(
+                draft.id, 
+                has_media=False,
+                media_position=draft.media_position,
+                content_length=len(draft.content) if draft.content else 0
+            ),
+            parse_mode="HTML",
+        )
+        
+        # If we got here, HTML is valid. Commit.
+        await session.commit()
+        await state.clear()
+        
+    except Exception as e:
+        # Check if it is a Telegram HTML error
+        if "can't parse entities" in str(e) or "tag" in str(e):
+            await session.rollback()
+            await message.answer(
+                "⚠️ <b>Ошибка форматирования!</b>\n\n"
+                "Telegram не смог обработать ваш текст. Скорее всего, нарушена структура HTML-тегов.\n\n"
+                "<b>Частые ошибки:</b>\n"
+                "• Открыли тег, но не закрыли его (например <code>&lt;b&gt;</code> без <code>&lt;/b&gt;</code>)\n"
+                "• Случайные скобки <code>&lt;</code> в тексте\n\n"
+                "Черновик <b>НЕ СОХРАНЕН</b>. Пожалуйста, проверьте текст и попробуйте снова.",
+                parse_mode="HTML"
+            )
+            # Do not clear state, let user retry
+            return
+        else:
+            # Other error (e.g. network), log it but maybe let it slide or retry?
+            # Better to be safe and rollback if we can't confirm.
+            logger.error(f"Draft creation validation failed: {e}")
+            await session.rollback()
+            await message.answer("❌ Ошибка при сохранении. Попробуйте еще раз.")
+            return
+
+
+@router.callback_query(F.data.startswith("drafts:view:"))
+async def view_draft(
+    callback: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    """View draft."""
+    draft_id = int(callback.data.split(":")[-1])
+
+    result = await session.execute(
+        select(Draft)
+        .where(Draft.id == draft_id)
+        .options(selectinload(Draft.media))
+    )
+    draft = result.scalar_one_or_none()
+
+    if not draft:
+        await callback.answer("❌ Черновик не найден", show_alert=True)
+        return
+
+    has_media = len(draft.media) > 0
+
+    # Информация о режиме публикации
+    if has_media:
+        text_len = len(draft.content) if draft.content else 0
+        if draft.media_position == "bottom":
+            mode_info = "\n\n📷 Фото: раздельно (текст и фото отдельными сообщениями)"
+        elif draft.media_position == "text_top":
+            mode_info = "\n\n📷 Фото: текст сверху (фото как превью снизу)"
+        elif text_len > 1000:
+            mode_info = "\n\n📷 Фото: вместе сверху (но текст длинный, будет 2 сообщения)"
+        else:
+            mode_info = "\n\n📷 Фото: вместе сверху (одно сообщение)"
+    else:
+        mode_info = ""
+
+    await answer_nav(
+        callback=callback,
+        label="✏️ Черновик",
+        new_text=(
+            f"{draft.content}"
+            f"{mode_info}"
+        ),
+        reply_markup=draft_edit_keyboard(
+            draft.id, 
+            has_media=has_media,
+            media_position=draft.media_position,
+            content_length=len(draft.content) if draft.content else 0
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drafts:edit_text:"))
+async def edit_text_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Start editing draft text manually."""
+    draft_id = int(callback.data.split(":")[-1])
+
+    await state.set_state(DraftStates.waiting_for_text)
+    await state.update_data(draft_id=draft_id, mode="replace")
+
+    await answer_nav(
+        callback=callback,
+        label="📝 Редактировать текст",
+        new_text=(
+            "✏️ <b>Редактирование текста</b>\n\n"
+            "Отправь новый текст поста целиком."
+        ),
+        reply_markup=back_to_draft_keyboard(draft_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drafts:ai_edit:"))
+async def ai_edit_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Start AI editing."""
+    draft_id = int(callback.data.split(":")[-1])
+
+    await state.set_state(DraftStates.waiting_for_ai_instructions)
+    await state.update_data(draft_id=draft_id)
+
+    await answer_nav(
+        callback=callback,
+        label="🤖 AI Редактирование",
+        new_text=(
+            "🤖 <b>AI редактирование</b>\n\n"
+            "Опиши, что нужно изменить в тексте.\n\n"
+            "<i>Примеры:</i>\n"
+            "• Сделай короче\n"
+            "• Добавь больше эмодзи\n"
+            "• Перепиши в более формальном стиле\n"
+            "• Добавь призыв к действию в конце"
+        ),
+        reply_markup=back_to_draft_keyboard(draft_id),
+    )
+    await callback.answer()
+
+
+@router.message(DraftStates.waiting_for_ai_instructions)
+async def process_ai_edit(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+) -> None:
+    """Process AI edit instructions."""
+    data = await state.get_data()
+    draft_id = data.get("draft_id")
+
+    result = await session.execute(
+        select(Draft)
+        .where(Draft.id == draft_id)
+        .options(selectinload(Draft.managed_channel))
+    )
+    draft = result.scalar_one_or_none()
+
+    if not draft:
+        await message.answer("❌ Черновик не найден")
+        await state.clear()
+        return
+
+    await message.answer("🔄 Редактирую текст...")
+
+    try:
+        # Release DB lock before LLM call
+        await session.commit()
+        
+        new_draft = await llm_client.rewrite_text(
+            original_text=draft.content,
+            user_instructions=message.text,
+            tone_of_voice=draft.managed_channel.tone_of_voice,
+            language=draft.managed_channel.language,
+        )
+    except Exception as e:
+        logger.error(f"AI edit failed: {e}")
+        await message.answer(
+            "❌ Ошибка при редактировании. Попробуй позже.",
+            reply_markup=draft_edit_keyboard(
+                draft.id,
+                has_media=bool(draft.media),
+                media_position=draft.media_position,
+                content_length=len(draft.content) if draft.content else 0
+            ),
+        )
+        await state.clear()
+        return
+
+    if not new_draft:
+        await message.answer(
+            "❌ Не удалось отредактировать текст.",
+            reply_markup=draft_edit_keyboard(draft.id),
+        )
+        await state.clear()
+        return
+
+    # Update draft
+    draft.title = new_draft.title
+    draft.content = sanitize_html(new_draft.content)
+    draft.status = DraftStatus.EDITING
+    
+    # Check media for keyboard
+    result = await session.execute(
+        select(DraftMedia).where(DraftMedia.draft_id == draft.id)
+    )
+    has_media = result.scalars().first() is not None
+
+    # --- PRE-VALIDATION ---
+    try:
+        # Validate by dry-run sending
+        await message.answer(
+            f"✅ <b>Текст обновлён!</b>\n\n"
+            f"{draft.content}",
+            reply_markup=draft_edit_keyboard(
+                draft.id, 
+                has_media=has_media,
+                media_position=draft.media_position,
+                content_length=len(draft.content) if draft.content else 0
+            ),
+            parse_mode="HTML",
+        )
+        
+        # Valid
+        await session.commit()
+        await state.clear()
+        
+    except Exception as e:
+        if "can't parse entities" in str(e) or "tag" in str(e):
+            await session.rollback()
+            await message.answer(
+                "⚠️ <b>AI ошибся с форматом</b>\n\n"
+                "Нейросеть сгенерировала текст с ошибкой в HTML-коде (обычно это незакрытый тег или левый символ).\n\n"
+                "<b>Что делать?</b>\n"
+                "1. Попробуйте еще раз (иногда это случайный сбой).\n"
+                "2. Или упростите инструкцию для редактирования.",
+                parse_mode="HTML"
+            )
+            # Restore state? Or clear? 
+            # If we clear, user loses context. Let's clear for now as existing pattern involves re-starting command often.
+            await state.clear()
+            return
+        else:
+            logger.error(f"AI edit validation failed: {e}")
+            await session.rollback()
+            await message.answer("❌ Ошибка при сохранении.")
+            await state.clear()
+            return
+
+
+@router.callback_query(F.data.startswith("drafts:preview:"))
+async def preview_draft(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    bot: Bot,
+) -> None:
+    """Show preview of how post will look."""
+    draft_id = int(callback.data.split(":")[-1])
+
+    result = await session.execute(
+        select(Draft)
+        .where(Draft.id == draft_id)
+        .options(
+            selectinload(Draft.media),
+            selectinload(Draft.managed_channel),
+        )
+    )
+    draft = result.scalar_one_or_none()
+
+    if not draft:
+        await callback.answer("❌ Черновик не найден", show_alert=True)
+        return
+
+    # 1. Clear buttons
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+        
+    # 2. Echo
+    await callback.message.answer("👁 Превью")
+    
+    # 3. Send preview (as new status)
+
+
+    # Send preview
+    # Use publish_content to handle long captions properly
+    await publish_content(bot, callback.message.chat.id, draft)
+
+    # Show controls
+    await callback.message.answer(
+        "👆 Так будет выглядеть пост",
+        reply_markup=draft_edit_keyboard(
+            draft.id, 
+            has_media=bool(draft.media),
+            media_position=draft.media_position,
+            content_length=len(draft.content) if draft.content else 0
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("drafts:publish:"))
+async def publish_draft_now(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    bot: Bot,
+) -> None:
+    """Publish draft immediately."""
+    draft_id = int(callback.data.split(":")[-1])
+
+    result = await session.execute(
+        select(Draft)
+        .where(Draft.id == draft_id)
+        .options(
+            selectinload(Draft.media),
+            selectinload(Draft.managed_channel),
+        )
+    )
+    draft = result.scalar_one_or_none()
+
+    if not draft:
+        await callback.answer("❌ Черновик не найден", show_alert=True)
+        return
+
+    channel = draft.managed_channel
+
+    # 1. Clear buttons
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+        
+    # 2. Echo
+    await callback.message.answer("🚀 Опубликовать")
+    
+    # 3. Status
+    progress_msg = await callback.message.answer("🚀 Публикую...")
+
+    try:
+        if draft.media:
+            # Prepare media object (needed for some logic inside but model has relationship)
+            pass
+
+        await publish_content(bot, channel.tg_channel_id, draft)
+
+        # Update status
+        draft.status = DraftStatus.PUBLISHED
+        await session.commit()
+
+        await progress_msg.delete()
+
+        await callback.message.answer(
+            f"✅ <b>Пост опубликован!</b>\n\n"
+            f"Канал: {channel.title}\n\n"
+            "💡 <b>Не забудьте сделать репост в Stories!</b>\n"
+            "<i>Это повышает охваты поста до 30%</i>",
+            reply_markup=back_to_menu_keyboard(),
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to publish draft {draft_id}: {e}")
+        await progress_msg.delete()
+        await callback.message.answer(
+            f"❌ Ошибка публикации: {e}",
+            reply_markup=draft_edit_keyboard(
+                draft.id, 
+                has_media=bool(draft.media),
+                media_position=draft.media_position,
+                content_length=len(draft.content) if draft.content else 0
+            ),
+            parse_mode="HTML"
+        )
+
+
+@router.callback_query(F.data.startswith("drafts:delete:"))
+async def delete_draft(
+    callback: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    """Delete draft."""
+    draft_id = int(callback.data.split(":")[-1])
+
+    result = await session.execute(
+        select(Draft).where(Draft.id == draft_id)
+    )
+    draft = result.scalar_one_or_none()
+
+    if not draft:
+        await callback.answer("❌ Черновик не найден", show_alert=True)
+        return
+
+    await session.delete(draft)
+    await session.commit()
+
+    # Logic:
+    # 1. Clear buttons
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+        
+    # 2. Echo
+    await callback.message.answer("🗑 Удалить черновик")
+
+    # 3. List
+    await list_drafts(callback, session)
+
+
+@router.callback_query(F.data.startswith("drafts:pos:"))
+async def toggle_media_position(
+    callback: CallbackQuery,
+    session: AsyncSession,
+) -> None:
+    """Toggle media position (top/text_top/bottom)."""
+    # drafts:pos:top:{id} or drafts:pos:text_top:{id}
+    parts = callback.data.split(":")
+    new_pos = parts[2]
+    draft_id = int(parts[3])
+
+    result = await session.execute(
+        select(Draft)
+        .where(Draft.id == draft_id)
+        .options(selectinload(Draft.media))
+    )
+    draft = result.scalar_one_or_none()
+
+    if not draft:
+        await callback.answer("❌ Черновик не найден", show_alert=True)
+        return
+
+    # Update
+    draft.media_position = new_pos
+    await session.commit()
+    
+    # Refresh view
+    # NOTE: The message might be a text message OR a photo message depending on how we got here.
+    # If it is a photo message, we must use edit_caption.
+    # If it is a text message, we must use edit_text.
+    
+    has_media = len(draft.media) > 0
+
+    # Информация о режиме публикации
+    if has_media:
+        text_len = len(draft.content) if draft.content else 0
+        if draft.media_position == "bottom":
+            mode_info = "\n\n📷 Фото: раздельно (текст и фото отдельными сообщениями)"
+        elif draft.media_position == "text_top":
+            mode_info = "\n\n📷 Фото: текст сверху (фото как превью снизу)"
+        elif text_len > 1000:
+            mode_info = "\n\n📷 Фото: вместе сверху (но текст длинный, будет 2 сообщения)"
+        else:
+            mode_info = "\n\n📷 Фото: вместе сверху (одно сообщение)"
+    else:
+        mode_info = ""
+
+    text_content = (
+        f"{draft.content}"
+        f"{mode_info}"
+    )
+    
+    reply_markup = draft_edit_keyboard(
+        draft.id, 
+        has_media=has_media,
+        media_position=draft.media_position,
+        content_length=len(draft.content) if draft.content else 0
+    )
+
+    try:
+        if callback.message.content_type == "photo":
+            await callback.message.edit_caption(
+                caption=text_content,
+                reply_markup=reply_markup,
+                parse_mode="HTML"
+            )
+        else:
+            await callback.message.edit_text(
+                text=text_content,
+                reply_markup=reply_markup,
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"Failed to toggle position view: {e}")
+        # If edit fails (e.g. content identical), just ignore or alert
+        pass
+
+    # Информативное уведомление с объяснением
+    text_len = len(draft.content) if draft.content else 0
+
+    if new_pos == 'bottom':
+        # Раздельная публикация
+        notify_text = "📄📷 Раздельно: текст и фото отдельными сообщениями"
+    elif new_pos == 'text_top':
+        # Текст сверху с превью снизу
+        notify_text = "📝🖼 Текст сверху: фото как превью снизу (одно сообщение)"
+    else:
+        # Фото сверху (top)
+        if text_len > 1000:
+            notify_text = "⚠️ Фото сверху: текст длинный (>1000), будет 2 сообщения"
+        else:
+            notify_text = "✅ Фото сверху: текст и фото в одном сообщении"
+
+    await callback.answer(notify_text, show_alert=False)
