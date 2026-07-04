@@ -24,19 +24,19 @@
 
 > **Open-source note.** TeleCeh is designed for personal or self-hosted use. Keep real bot tokens, API keys, databases, logs, and Telegram session files out of the repository.
 
-## Features
+## ✨ Features
 
-- **Multi-channel workspace**: manage several Telegram channels from one bot.
-- **Donor monitoring**: parse public Telegram channels through `t.me/s/`.
-- **AI idea generation**: turn donor posts into content ideas for your channels.
-- **Draft writing and rewriting**: generate posts with channel tone of voice.
-- **Tone of voice**: derive style from recent posts or set it manually.
-- **AI images**: generate media with OpenAI or Kie.ai.
-- **Spaces**: collect DOCX, XLSX, PDF, links, images, and audio as source material.
-- **YouTube ideas**: extract public transcripts with `youtube-transcript-api`.
-- **Content plan**: plan posts and publish them automatically.
+- 📢 **Multi-channel workspace**: manage several Telegram channels from one bot.
+- 🧲 **Donor monitoring**: parse public Telegram channels through `t.me/s/`.
+- 💡 **AI idea generation**: turn donor posts into content ideas for your channels.
+- ✍️ **Draft writing and rewriting**: generate posts with channel tone of voice.
+- 🎙️ **Tone of voice**: derive style from recent posts or set it manually.
+- 🎨 **AI images**: generate media with OpenAI or Kie.ai.
+- 📁 **Spaces**: collect DOCX, XLSX, PDF, links, images, and audio as source material.
+- ▶️ **YouTube ideas**: extract public transcripts with `youtube-transcript-api`.
+- 🗓️ **Content plan**: plan posts and publish them automatically.
 
-## Stack
+## 🧰 Stack
 
 | Area | Technology |
 |---|---|
@@ -47,7 +47,7 @@
 | Documents | python-docx, openpyxl, PyPDF2 |
 | Parsing | aiohttp, BeautifulSoup, `t.me/s/` |
 
-## Quick Start
+## 🚀 Quick Start
 
 ```bash
 git clone https://github.com/mf-volk/content-zavod.git
@@ -73,7 +73,7 @@ Run the bot:
 python -m app.main
 ```
 
-## Configuration
+## ⚙️ Configuration
 
 TeleCeh reads settings from `.env` via `pydantic-settings`.
 
@@ -90,7 +90,7 @@ TeleCeh reads settings from `.env` via `pydantic-settings`.
 
 Full environment reference: [.env.example](.env.example).
 
-## AI Provider Modes
+## 🤖 AI Provider Modes
 
 | `AI_PROVIDER` | Text | Images | Voice / Vision |
 |---|---|---|---|
@@ -99,7 +99,7 @@ Full environment reference: [.env.example](.env.example).
 
 Text generation always uses the OpenAI-compatible client. Voice transcription and image understanding also use OpenAI models, so `OPENAI_API_KEY` is required in both modes.
 
-## Usage
+## 🧭 Usage
 
 1. Send `/start` to your bot.
 2. Add a managed channel. The bot must be an admin with publishing rights.
@@ -107,7 +107,7 @@ Text generation always uses the OpenAI-compatible client. Voice transcription an
 4. Add donor channels and generate ideas.
 5. Turn ideas into drafts, attach media, and schedule publication.
 
-## Project Structure
+## 🗂️ Project Structure
 
 ```text
 content-zavod/
@@ -128,7 +128,7 @@ content-zavod/
 `-- README.md
 ```
 
-## Database
+## 🗄️ Database
 
 Tables are created automatically on first run with `Base.metadata.create_all`. SQLite is the default local database. PostgreSQL can be used for production:
 
@@ -138,7 +138,7 @@ DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/content_zavod
 
 Existing installations should apply schema changes manually with scripts in `scripts/`.
 
-## Development
+## 🛠️ Development
 
 ```bash
 pip install -r requirements.txt
@@ -154,10 +154,10 @@ Conventions:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Security
+## 🔐 Security
 
 Read [SECURITY.md](SECURITY.md) before publishing a fork or deploying a public instance. The bot may store drafts, channel metadata, donor posts, user materials, and optional user-provided API keys in the configured database.
 
-## License
+## 📄 License
 
 [MIT](LICENSE)
