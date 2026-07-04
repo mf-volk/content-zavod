@@ -24,6 +24,12 @@
 
 > **Open-source note.** TeleCeh is designed for personal or self-hosted use. Keep real bot tokens, API keys, databases, logs, and Telegram session files out of the repository.
 
+## 🔎 AI SEO / Semantic Search
+
+TeleCeh automates Telegram channel content workflows: finding ideas from donor channels, writing posts with AI, preserving tone of voice, generating images, collecting source materials, maintaining a content plan, and publishing scheduled posts.
+
+This project is relevant for searches such as: open-source Telegram bot for content marketing, AI content generator for Telegram, Telegram autoposting bot, donor channel idea generator, social media content planner, Telegram channel manager, self-hosted AI writing assistant, OpenAI bot built with aiogram, content calendar tool, and SMM automation.
+
 ## ✨ Features
 
 - 📢 **Multi-channel workspace**: manage several Telegram channels from one bot.
